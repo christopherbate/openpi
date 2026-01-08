@@ -7,6 +7,7 @@ import jax.numpy as jnp
 
 import openpi.models.model as _model
 import openpi.policies.policy as _policy
+from openpi.quantization import fp8_ptq as _fp8_ptq
 import openpi.shared.download as download
 from openpi.training import checkpoints as _checkpoints
 from openpi.training import config as _config
@@ -22,6 +23,7 @@ def create_trained_policy(
     default_prompt: str | None = None,
     norm_stats: dict[str, transforms.NormStats] | None = None,
     pytorch_device: str | None = None,
+    mtrt_fp8_scales_json: str | None = None,
 ) -> _policy.Policy:
     """Create a policy from a trained checkpoint.
 
@@ -71,6 +73,14 @@ def create_trained_policy(
             pytorch_device = "cuda" if torch.cuda.is_available() else "cpu"
         except ImportError:
             pytorch_device = "cpu"
+
+    if mtrt_fp8_scales_json is not None:
+        if is_pytorch:
+            raise ValueError("mtrt_fp8_scales_json is only supported for JAX models (not PyTorch).")
+        # Enable MLIR-TRT FP8 mode globally before Policy creation (so the jit capture sees it).
+        scales = _fp8_ptq.load_scales_json(mtrt_fp8_scales_json)
+        _fp8_ptq.enable_mtrt_fp8(scales)
+        logging.info("Enabled MLIR-TRT FP8 inference using scales JSON: %s", mtrt_fp8_scales_json)
 
     return _policy.Policy(
         model,

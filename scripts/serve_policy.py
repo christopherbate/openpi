@@ -51,6 +51,10 @@ class Args:
     # Record the policy's behavior for debugging.
     record: bool = False
 
+    # Enable MLIR-TensorRT FP8 inference by providing a calibrated scales JSON file.
+    # Requires running under the mlir_tensorrt backend (e.g., `export JAX_PLATFORMS=mlir_tensorrt`).
+    mtrt_fp8_scales_json: str | None = None
+
     # Specifies how to load the policy. If not provided, the default policy for the environment will be used.
     policy: Checkpoint | Default = dataclasses.field(default_factory=Default)
 
@@ -90,10 +94,20 @@ def create_policy(args: Args) -> _policy.Policy:
     match args.policy:
         case Checkpoint():
             return _policy_config.create_trained_policy(
-                _config.get_config(args.policy.config), args.policy.dir, default_prompt=args.default_prompt
+                _config.get_config(args.policy.config),
+                args.policy.dir,
+                default_prompt=args.default_prompt,
+                mtrt_fp8_scales_json=args.mtrt_fp8_scales_json,
             )
         case Default():
-            return create_default_policy(args.env, default_prompt=args.default_prompt)
+            # Default policy path also supports MLIR-TRT FP8 inference.
+            checkpoint = DEFAULT_CHECKPOINT[args.env]
+            return _policy_config.create_trained_policy(
+                _config.get_config(checkpoint.config),
+                checkpoint.dir,
+                default_prompt=args.default_prompt,
+                mtrt_fp8_scales_json=args.mtrt_fp8_scales_json,
+            )
 
 
 def main(args: Args) -> None:

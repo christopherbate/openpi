@@ -6,6 +6,7 @@ import flax.struct as struct
 import jax.numpy as jnp
 
 import openpi.shared.array_typing as at
+from openpi.quantization import fp8_ptq as _fp8_ptq
 
 
 @struct.dataclass
@@ -52,16 +53,53 @@ class Einsum(nn.Module):
             self.w_b = self.param("lora_b", config.init_fn, shape_b)
 
     @nn.compact
-    def __call__(self, eqn: str, x):
+    def __call__(self, eqn: str, x, *, layer_id=None):
         dtype = x.dtype  # original dtype, could be half-precision
-        result = jnp.einsum(eqn, x, self.w.astype(dtype))
+        # FP8 PTQ calibration taps (no-op unless enabled).
+        _fp8_ptq.record_module_amax(self, tag="einsum/x_amax", x=x, layer_id=layer_id)
+        _fp8_ptq.record_module_amax(self, tag="einsum/w_amax", x=self.w, layer_id=layer_id)
+        result = None
+
+        # Optional MLIR-TensorRT FP8 inference path (opt-in).
+        if _fp8_ptq.is_mtrt_fp8_enabled():
+            sx = _fp8_ptq.get_mtrt_quant_scale(self, tag="einsum/x_amax", layer_id=layer_id)
+            sw = _fp8_ptq.get_mtrt_quant_scale(self, tag="einsum/w_amax", layer_id=layer_id)
+            sy = _fp8_ptq.get_mtrt_quant_scale(self, tag="einsum/out_amax", layer_id=layer_id)
+            fp8_dtype = getattr(jnp, "float8_e4m3fn", None)
+            if sx is not None and sw is not None and sy is not None and fp8_dtype is not None:
+                from mlir_tensorrt_jax.mtrt_ops import mtrt_dequantize, mtrt_quantize  # type: ignore
+
+                sx_arr = jnp.asarray(sx, dtype=jnp.float32)
+                sw_arr = jnp.asarray(sw, dtype=jnp.float32)
+                sy_arr = jnp.asarray(sy, dtype=jnp.float32)
+
+                # Quantize x and w to FP8 (per-tensor).
+                x_q = mtrt_quantize(x.astype(jnp.bfloat16), sx_arr, mode="tensorrt.pt_q", output_dtype=fp8_dtype)
+                x_dq = mtrt_dequantize(x_q, sx_arr, mode="tensorrt.pt_dq", output_dtype=jnp.bfloat16)
+
+                w_q = mtrt_quantize(self.w.astype(jnp.bfloat16), sw_arr, mode="tensorrt.pt_q", output_dtype=fp8_dtype)
+                w_dq = mtrt_dequantize(w_q, sw_arr, mode="tensorrt.pt_dq", output_dtype=jnp.bfloat16)
+
+                y = jnp.einsum(eqn, x_dq, w_dq)
+
+                # Force output back to bf16 via explicit quantize + dequantize (per-tensor).
+                result_q = mtrt_quantize(y, sy_arr, mode="tensorrt.pt_q", output_dtype=fp8_dtype)
+                result_dq = mtrt_dequantize(result_q, sy_arr, mode="tensorrt.pt_dq", output_dtype=jnp.dtype(dtype))
+                result = result_dq
+
+        if result is None:
+            result = jnp.einsum(eqn, x, self.w.astype(dtype))
 
         if config := self.lora_config:
+            # Record LoRA weights as well (useful if LoRA is enabled for calibration).
+            _fp8_ptq.record_module_amax(self, tag="einsum/lora_a_amax", x=self.w_a, layer_id=layer_id)
+            _fp8_ptq.record_module_amax(self, tag="einsum/lora_b_amax", x=self.w_b, layer_id=layer_id)
             eqn_a, eqn_b = self._make_lora_eqns(eqn)
             lora = jnp.einsum(eqn_a, x, self.w_a.astype(dtype))
             lora = jnp.einsum(eqn_b, lora, self.w_b.astype(dtype))
             result = result + lora * config.scaling_value
 
+        _fp8_ptq.record_module_amax(self, tag="einsum/out_amax", x=result, layer_id=layer_id)
         return result
 
     def _make_lora_eqns(self, eqn: str) -> tuple[str, str]:
@@ -121,12 +159,14 @@ class FeedForward(nn.Module):
             )
 
     @nn.compact
-    def __call__(self, x):
+    def __call__(self, x, *, layer_id=None):
         dtype = x.dtype  # original dtype, could be half-precision
         ff_gate = self._dot(
             x,
             self.w_gating[0],
             None if self.w_gating_lora is None else (self.w_gating_lora[0][0], self.w_gating_lora[1][0]),
+            tag="gating_0",
+            layer_id=layer_id,
         )
         gate_value = nn.gelu(ff_gate)
 
@@ -134,15 +174,60 @@ class FeedForward(nn.Module):
             x,
             self.w_gating[1],
             None if self.w_gating_lora is None else (self.w_gating_lora[0][1], self.w_gating_lora[1][1]),
+            tag="gating_1",
+            layer_id=layer_id,
         )
         activations = gate_value * ff1
 
-        outputs = self._dot(activations, self.w_linear, self.w_linear_lora)
+        outputs = self._dot(activations, self.w_linear, self.w_linear_lora, tag="linear", layer_id=layer_id)
         assert outputs.dtype == dtype
         return outputs
 
-    def _dot(self, x: at.Array, w: at.Array, lora_weights: tuple[at.Array, at.Array] | None) -> at.Array:
-        base = jnp.dot(x, w.astype(x.dtype))
+    def _dot(
+        self,
+        x: at.Array,
+        w: at.Array,
+        lora_weights: tuple[at.Array, at.Array] | None,
+        *,
+        tag: str,
+        layer_id=None,
+    ) -> at.Array:
+        # FP8 PTQ calibration taps (no-op unless enabled).
+        _fp8_ptq.record_module_amax(self, tag=f"ffn/{tag}/x_amax", x=x, layer_id=layer_id)
+        _fp8_ptq.record_module_amax(self, tag=f"ffn/{tag}/w_amax", x=w, layer_id=layer_id)
+        base = None
+
+        if _fp8_ptq.is_mtrt_fp8_enabled():
+            sx = _fp8_ptq.get_mtrt_quant_scale(self, tag=f"ffn/{tag}/x_amax", layer_id=layer_id)
+            sw = _fp8_ptq.get_mtrt_quant_scale(self, tag=f"ffn/{tag}/w_amax", layer_id=layer_id)
+            sy = _fp8_ptq.get_mtrt_quant_scale(self, tag=f"ffn/{tag}/out_amax", layer_id=layer_id)
+            fp8_dtype = getattr(jnp, "float8_e4m3fn", None)
+            if sx is not None and sw is not None and sy is not None and fp8_dtype is not None:
+                try:
+                    from mlir_tensorrt_jax.mtrt_ops import mtrt_dequantize, mtrt_quantize  # type: ignore
+
+                    sx_arr = jnp.asarray(sx, dtype=jnp.float32)
+                    sw_arr = jnp.asarray(sw, dtype=jnp.float32)
+                    sy_arr = jnp.asarray(sy, dtype=jnp.float32)
+
+                    x_q = mtrt_quantize(x.astype(jnp.bfloat16), sx_arr, mode="tensorrt.pt_q", output_dtype=fp8_dtype)
+                    x_dq = mtrt_dequantize(x_q, sx_arr, mode="tensorrt.pt_dq", output_dtype=jnp.dtype(x.dtype))
+                    w_q = mtrt_quantize(w.astype(jnp.bfloat16), sw_arr, mode="tensorrt.pt_q", output_dtype=fp8_dtype)
+                    w_dq = mtrt_dequantize(w_q, sw_arr, mode="tensorrt.pt_dq", output_dtype=jnp.dtype(w.dtype))
+                    y = jnp.dot(x_dq, w_dq)
+                    base_q = mtrt_quantize(y, sy_arr, mode="tensorrt.pt_q", output_dtype=fp8_dtype)
+                    base_dq = mtrt_dequantize(base_q, sy_arr, mode="tensorrt.pt_dq", output_dtype=jnp.dtype(y.dtype))
+                    base = base_dq
+                except Exception:
+                    base = None
+
+        if base is None:
+            base = jnp.dot(x, w.astype(x.dtype))
         if lora_weights is None:
+            _fp8_ptq.record_module_amax(self, tag=f"ffn/{tag}/out_amax", x=base, layer_id=layer_id)
             return base
-        return base + jnp.dot(jnp.dot(x, lora_weights[0].astype(x.dtype)), lora_weights[1].astype(x.dtype))
+        _fp8_ptq.record_module_amax(self, tag=f"ffn/{tag}/lora_a_amax", x=lora_weights[0], layer_id=layer_id)
+        _fp8_ptq.record_module_amax(self, tag=f"ffn/{tag}/lora_b_amax", x=lora_weights[1], layer_id=layer_id)
+        out = base + jnp.dot(jnp.dot(x, lora_weights[0].astype(x.dtype)), lora_weights[1].astype(x.dtype))
+        _fp8_ptq.record_module_amax(self, tag=f"ffn/{tag}/out_amax", x=out, layer_id=layer_id)
+        return out

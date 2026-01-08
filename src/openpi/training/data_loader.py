@@ -2,6 +2,7 @@ from collections.abc import Iterator, Sequence
 import logging
 import multiprocessing
 import os
+import pathlib
 import typing
 from typing import Literal, Protocol, SupportsIndex, TypeVar
 
@@ -14,6 +15,8 @@ import torch
 import openpi.models.model as _model
 import openpi.training.config as _config
 from openpi.training.droid_rlds_dataset import DroidRldsDataset
+from openpi.training.lerobot_hf_dataset import HFParquetLeRobotDataset
+from openpi.training.lerobot_hf_dataset import Meta as HFParquetLeRobotMeta
 import openpi.transforms as _transforms
 
 T_co = TypeVar("T_co", covariant=True)
@@ -138,12 +141,27 @@ def create_torch_dataset(
         return FakeDataset(model_config, num_samples=1024)
 
     dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id)
-    dataset = lerobot_dataset.LeRobotDataset(
-        data_config.repo_id,
-        delta_timestamps={
-            key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
-        },
-    )
+    delta_timestamps = {key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys}
+    try:
+        dataset = lerobot_dataset.LeRobotDataset(
+            data_config.repo_id,
+            delta_timestamps=delta_timestamps,
+        )
+    except TypeError as e:
+        # LeRobotDataset can fail on older dataset versions when it tries to torch.stack a HF Column
+        # (e.g., physical-intelligence/libero v2.0). Fall back to a parquet-backed loader without
+        # timestamp sync checks.
+        logging.warning("LeRobotDataset init failed (%s); falling back to HFParquetLeRobotDataset", e)
+        from lerobot.common.constants import HF_LEROBOT_HOME
+
+        root = pathlib.Path(HF_LEROBOT_HOME) / repo_id
+        meta = HFParquetLeRobotMeta(
+            fps=dataset_meta.fps,
+            tasks=dataset_meta.tasks,
+            episodes=dataset_meta.episodes,
+            video_keys=tuple(getattr(dataset_meta, "video_keys", ())),
+        )
+        dataset = HFParquetLeRobotDataset(repo_id=repo_id, root=root, delta_timestamps=delta_timestamps, meta=meta)
 
     if data_config.prompt_from_task:
         dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(dataset_meta.tasks)])
