@@ -7,6 +7,9 @@ from typing import Any, ParamSpec, TypeVar
 
 import flax.nnx as nnx
 import jax
+from jax import export
+from jax._src.interpreters import mlir as jax_mlir
+from jax._src.lib.mlir import ir
 
 P = ParamSpec("P")
 R = TypeVar("R")
@@ -41,6 +44,58 @@ def module_jit(meth: Callable[P, R], *jit_args, **jit_kwargs) -> Callable[P, R]:
         return jitted_fn(state, *args, **kwargs)
 
     return wrapper
+
+
+# Helper: turn a pytree of arrays into ShapeDtypeStructs for export
+def specs_like(tree):
+    return jax.tree.map(lambda a: jax.ShapeDtypeStruct(a.shape, a.dtype), tree)
+
+
+def module_export_stablehlo(
+    meth: Callable[P, R],
+    example_inputs,
+    # TODO: add support for using weights-as-inputs a'la `module_jit` above.
+    # internalize_constants: bool = False,
+    elide_elementsattrs_if_larger: int | None = None,
+    *jit_args,
+    **jit_kwargs,
+) -> str:
+    """Export a `nnx.Module` method to StableHLO.
+
+    Args:
+        meth: The method to export.
+        example_inputs: The example inputs to the method. These are used to determine the shapes and dtypes of the inputs.
+        elide_elementsattrs_if_larger: The maximum allowed weight to be embedded in the returned string, otherwise,
+          the actual weight data is specified as "elided", which is a mechanism in MLIR that avoids embedding the weight data
+          while still allowing the result to be a valid MLIR module.
+        *jit_args: Additional arguments to pass to the JIT transformation.
+        **jit_kwargs: Additional keyword arguments to pass to the JIT transformation.
+    Returns:
+        The StableHLO module as a string.
+    """
+
+    if not (inspect.ismethod(meth) and isinstance(meth.__self__, nnx.Module)):
+        raise ValueError("module_jit must only be used on bound methods of nnx.Modules.")
+
+    graphdef, state = nnx.split(meth.__self__)
+
+    # As opposed to `module_jit` above, we treat state as constant here, so it doesn't need to be passed as an argument.
+    # The JIT transformation internalizes the state.
+    def forward(*args, **kwargs):
+        m = nnx.merge(graphdef, state)
+        return meth.__func__(m, *args, **kwargs)
+
+    jitted_fn = jax.jit(forward, *jit_args, **jit_kwargs)
+
+    # Returns prettyprint of StableHLO module.
+    def get_stablehlo_asm(module_str: str) -> str:
+        with jax_mlir.make_ir_context():
+            stablehlo_module = ir.Module.parse(module_str, context=jax_mlir.make_ir_context())
+            return stablehlo_module.operation.get_asm(large_elements_limit=elide_elementsattrs_if_larger)  # type: ignore
+
+    # Export the function to StableHLO
+    exported_module = export.export(jitted_fn)(*[specs_like(x) for x in example_inputs]).mlir_module()  # type: ignore
+    return get_stablehlo_asm(exported_module)
 
 
 @dataclasses.dataclass(frozen=True)

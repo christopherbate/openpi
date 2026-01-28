@@ -33,6 +33,7 @@ class Policy(BasePolicy):
         metadata: dict[str, Any] | None = None,
         pytorch_device: str = "cpu",
         is_pytorch: bool = False,
+        stablehlo_export_file: str | None = None,
     ):
         """Initialize the Policy.
 
@@ -46,6 +47,7 @@ class Policy(BasePolicy):
             pytorch_device: Device to use for PyTorch models (e.g., "cpu", "cuda:0").
                           Only relevant when is_pytorch=True.
             is_pytorch: Whether the model is a PyTorch model. If False, assumes JAX model.
+            stablehlo_export_file: The file to export the StableHLO module to.
         """
         self._model = model
         self._input_transform = _transforms.compose(transforms)
@@ -54,6 +56,7 @@ class Policy(BasePolicy):
         self._metadata = metadata or {}
         self._is_pytorch_model = is_pytorch
         self._pytorch_device = pytorch_device
+        self._stablehlo_export_file = stablehlo_export_file
 
         if self._is_pytorch_model:
             self._model = self._model.to(pytorch_device)
@@ -77,6 +80,20 @@ class Policy(BasePolicy):
             # Convert inputs to PyTorch tensors and move to correct device
             inputs = jax.tree.map(lambda x: torch.from_numpy(np.array(x)).to(self._pytorch_device)[None, ...], inputs)
             sample_rng_or_pytorch_device = self._pytorch_device
+
+        if (
+            self._stablehlo_export_file is not None
+            and not self._is_pytorch_model
+            and not pathlib.Path(self._stablehlo_export_file).exists()
+        ):
+            observation = _model.Observation.from_dict(inputs)
+            stablehlo_asm = nnx_utils.module_export_stablehlo(
+                self._model.sample_actions,
+                example_inputs=[sample_rng_or_pytorch_device, observation],
+                internalize_constants=True,
+                elide_elementsattrs_if_larger=128,
+            )
+            pathlib.Path(self._stablehlo_export_file).write_text(stablehlo_asm)
 
         # Prepare kwargs for sample_actions
         sample_kwargs = dict(self._sample_kwargs)
