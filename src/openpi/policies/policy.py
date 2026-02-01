@@ -84,14 +84,12 @@ class Policy(BasePolicy):
         if (
             self._stablehlo_export_file is not None
             and not self._is_pytorch_model
-            and not pathlib.Path(self._stablehlo_export_file).exists()
         ):
             observation = _model.Observation.from_dict(inputs)
             stablehlo_asm = nnx_utils.module_export_stablehlo(
                 self._model.sample_actions,
                 example_inputs=[sample_rng_or_pytorch_device, observation],
-                internalize_constants=True,
-                elide_elementsattrs_if_larger=128,
+                elide_elementsattrs_if_larger=None,
             )
             pathlib.Path(self._stablehlo_export_file).write_text(stablehlo_asm)
 

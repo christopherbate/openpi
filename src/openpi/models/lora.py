@@ -3,10 +3,11 @@ import re
 
 import flax.linen as nn
 import flax.struct as struct
+import jax
 import jax.numpy as jnp
 
-import openpi.shared.array_typing as at
 from openpi.quantization import fp8_ptq as _fp8_ptq
+import openpi.shared.array_typing as at
 
 
 @struct.dataclass
@@ -53,7 +54,7 @@ class Einsum(nn.Module):
             self.w_b = self.param("lora_b", config.init_fn, shape_b)
 
     @nn.compact
-    def __call__(self, eqn: str, x, *, layer_id=None):
+    def __call__(self, eqn: str, x: jax.Array, *, layer_id=None):
         dtype = x.dtype  # original dtype, could be half-precision
         # FP8 PTQ calibration taps (no-op unless enabled).
         _fp8_ptq.record_module_amax(self, tag="einsum/x_amax", x=x, layer_id=layer_id)
@@ -61,31 +62,23 @@ class Einsum(nn.Module):
         result = None
 
         # Optional MLIR-TensorRT FP8 inference path (opt-in).
-        if _fp8_ptq.is_mtrt_fp8_enabled():
-            sx = _fp8_ptq.get_mtrt_quant_scale(self, tag="einsum/x_amax", layer_id=layer_id)
-            sw = _fp8_ptq.get_mtrt_quant_scale(self, tag="einsum/w_amax", layer_id=layer_id)
-            sy = _fp8_ptq.get_mtrt_quant_scale(self, tag="einsum/out_amax", layer_id=layer_id)
-            fp8_dtype = getattr(jnp, "float8_e4m3fn", None)
-            if sx is not None and sw is not None and sy is not None and fp8_dtype is not None:
-                from mlir_tensorrt_jax.mtrt_ops import mtrt_dequantize, mtrt_quantize  # type: ignore
-
-                sx_arr = jnp.asarray(sx, dtype=jnp.float32)
-                sw_arr = jnp.asarray(sw, dtype=jnp.float32)
-                sy_arr = jnp.asarray(sy, dtype=jnp.float32)
-
-                # Quantize x and w to FP8 (per-tensor).
-                x_q = mtrt_quantize(x.astype(jnp.bfloat16), sx_arr, mode="tensorrt.pt_q", output_dtype=fp8_dtype)
-                x_dq = mtrt_dequantize(x_q, sx_arr, mode="tensorrt.pt_dq", output_dtype=jnp.bfloat16)
-
-                w_q = mtrt_quantize(self.w.astype(jnp.bfloat16), sw_arr, mode="tensorrt.pt_q", output_dtype=fp8_dtype)
-                w_dq = mtrt_dequantize(w_q, sw_arr, mode="tensorrt.pt_dq", output_dtype=jnp.bfloat16)
-
+        scales = _fp8_ptq.maybe_get_mtrt_qdq_scales(
+            self,
+            x_tag="einsum/x_amax",
+            w_tag="einsum/w_amax",
+            out_tag="einsum/out_amax",
+            layer_id=layer_id,
+        )
+        if scales is not None:
+            sx_arr, sw_arr, sy_arr = scales
+            x_dq = _fp8_ptq.fp8_qdq(x, sx_arr)
+            w_dq = _fp8_ptq.fp8_qdq(self.w, sw_arr)
+            if x_dq is not None and w_dq is not None:
                 y = jnp.einsum(eqn, x_dq, w_dq)
-
-                # Force output back to bf16 via explicit quantize + dequantize (per-tensor).
-                result_q = mtrt_quantize(y, sy_arr, mode="tensorrt.pt_q", output_dtype=fp8_dtype)
-                result_dq = mtrt_dequantize(result_q, sy_arr, mode="tensorrt.pt_dq", output_dtype=jnp.dtype(dtype))
-                result = result_dq
+                if sy_arr is not None:
+                    result = _fp8_ptq.fp8_qdq(y, sy_arr)
+                else:
+                    result = y.astype(dtype)
 
         if result is None:
             result = jnp.einsum(eqn, x, self.w.astype(dtype))
@@ -97,9 +90,30 @@ class Einsum(nn.Module):
             eqn_a, eqn_b = self._make_lora_eqns(eqn)
             lora = jnp.einsum(eqn_a, x, self.w_a.astype(dtype))
             lora = jnp.einsum(eqn_b, lora, self.w_b.astype(dtype))
-            result = result + lora * config.scaling_value
+            lora_scaled = lora * config.scaling_value
+            # Treat the LoRA add as a "bias add"-style op: record + optional operand Q/DQ on both add inputs,
+            # independent of whether output Q/DQ is enabled.
+            _fp8_ptq.record_module_amax(self, tag="einsum/lora_add/x_amax", x=result, layer_id=layer_id)
+            _fp8_ptq.record_module_amax(self, tag="einsum/lora_add/w_amax", x=lora_scaled, layer_id=layer_id)
+            add_scales = _fp8_ptq.maybe_get_mtrt_qdq_scales(
+                self,
+                x_tag="einsum/lora_add/x_amax",
+                w_tag="einsum/lora_add/w_amax",
+                out_tag=None,
+                layer_id=layer_id,
+            )
+            if add_scales is not None:
+                sax_arr, saw_arr, _ = add_scales
+                base_dq = _fp8_ptq.fp8_qdq(result, sax_arr)
+                lora_dq = _fp8_ptq.fp8_qdq(lora_scaled, saw_arr)
+                if base_dq is not None and lora_dq is not None:
+                    result = base_dq + lora_dq
+                else:
+                    result = result + lora_scaled
+            else:
+                result = result + lora_scaled
 
-        _fp8_ptq.record_module_amax(self, tag="einsum/out_amax", x=result, layer_id=layer_id)
+        _fp8_ptq.record_module_out_amax(self, tag="einsum/out_amax", x=result, layer_id=layer_id)
         return result
 
     def _make_lora_eqns(self, eqn: str) -> tuple[str, str]:
@@ -197,37 +211,49 @@ class FeedForward(nn.Module):
         _fp8_ptq.record_module_amax(self, tag=f"ffn/{tag}/w_amax", x=w, layer_id=layer_id)
         base = None
 
-        if _fp8_ptq.is_mtrt_fp8_enabled():
-            sx = _fp8_ptq.get_mtrt_quant_scale(self, tag=f"ffn/{tag}/x_amax", layer_id=layer_id)
-            sw = _fp8_ptq.get_mtrt_quant_scale(self, tag=f"ffn/{tag}/w_amax", layer_id=layer_id)
-            sy = _fp8_ptq.get_mtrt_quant_scale(self, tag=f"ffn/{tag}/out_amax", layer_id=layer_id)
-            fp8_dtype = getattr(jnp, "float8_e4m3fn", None)
-            if sx is not None and sw is not None and sy is not None and fp8_dtype is not None:
-                try:
-                    from mlir_tensorrt_jax.mtrt_ops import mtrt_dequantize, mtrt_quantize  # type: ignore
-
-                    sx_arr = jnp.asarray(sx, dtype=jnp.float32)
-                    sw_arr = jnp.asarray(sw, dtype=jnp.float32)
-                    sy_arr = jnp.asarray(sy, dtype=jnp.float32)
-
-                    x_q = mtrt_quantize(x.astype(jnp.bfloat16), sx_arr, mode="tensorrt.pt_q", output_dtype=fp8_dtype)
-                    x_dq = mtrt_dequantize(x_q, sx_arr, mode="tensorrt.pt_dq", output_dtype=jnp.dtype(x.dtype))
-                    w_q = mtrt_quantize(w.astype(jnp.bfloat16), sw_arr, mode="tensorrt.pt_q", output_dtype=fp8_dtype)
-                    w_dq = mtrt_dequantize(w_q, sw_arr, mode="tensorrt.pt_dq", output_dtype=jnp.dtype(w.dtype))
-                    y = jnp.dot(x_dq, w_dq)
-                    base_q = mtrt_quantize(y, sy_arr, mode="tensorrt.pt_q", output_dtype=fp8_dtype)
-                    base_dq = mtrt_dequantize(base_q, sy_arr, mode="tensorrt.pt_dq", output_dtype=jnp.dtype(y.dtype))
-                    base = base_dq
-                except Exception:
-                    base = None
+        scales = _fp8_ptq.maybe_get_mtrt_qdq_scales(
+            self,
+            x_tag=f"ffn/{tag}/x_amax",
+            w_tag=f"ffn/{tag}/w_amax",
+            out_tag=f"ffn/{tag}/out_amax",
+            layer_id=layer_id,
+        )
+        if scales is not None:
+            sx_arr, sw_arr, sy_arr = scales
+            x_dq = _fp8_ptq.fp8_qdq(x, sx_arr)
+            w_dq = _fp8_ptq.fp8_qdq(w, sw_arr)
+            if x_dq is not None and w_dq is not None:
+                y = jnp.dot(x_dq, w_dq)
+                if sy_arr is not None:
+                    base = _fp8_ptq.fp8_qdq(y, sy_arr)
+                else:
+                    base = y
 
         if base is None:
             base = jnp.dot(x, w.astype(x.dtype))
         if lora_weights is None:
-            _fp8_ptq.record_module_amax(self, tag=f"ffn/{tag}/out_amax", x=base, layer_id=layer_id)
+            _fp8_ptq.record_module_out_amax(self, tag=f"ffn/{tag}/out_amax", x=base, layer_id=layer_id)
             return base
         _fp8_ptq.record_module_amax(self, tag=f"ffn/{tag}/lora_a_amax", x=lora_weights[0], layer_id=layer_id)
         _fp8_ptq.record_module_amax(self, tag=f"ffn/{tag}/lora_b_amax", x=lora_weights[1], layer_id=layer_id)
-        out = base + jnp.dot(jnp.dot(x, lora_weights[0].astype(x.dtype)), lora_weights[1].astype(x.dtype))
-        _fp8_ptq.record_module_amax(self, tag=f"ffn/{tag}/out_amax", x=out, layer_id=layer_id)
+        lora_update = jnp.dot(jnp.dot(x, lora_weights[0].astype(x.dtype)), lora_weights[1].astype(x.dtype))
+        # Treat the LoRA add as a "bias add"-style op: record + optional operand Q/DQ on both add inputs,
+        # independent of whether output Q/DQ is enabled.
+        _fp8_ptq.record_module_amax(self, tag=f"ffn/{tag}/lora_add/x_amax", x=base, layer_id=layer_id)
+        _fp8_ptq.record_module_amax(self, tag=f"ffn/{tag}/lora_add/w_amax", x=lora_update, layer_id=layer_id)
+        add_scales = _fp8_ptq.maybe_get_mtrt_qdq_scales(
+            self,
+            x_tag=f"ffn/{tag}/lora_add/x_amax",
+            w_tag=f"ffn/{tag}/lora_add/w_amax",
+            out_tag=None,
+            layer_id=layer_id,
+        )
+        if add_scales is not None:
+            sax_arr, saw_arr, _ = add_scales
+            base_dq = _fp8_ptq.fp8_qdq(base, sax_arr)
+            upd_dq = _fp8_ptq.fp8_qdq(lora_update, saw_arr)
+            out = base_dq + upd_dq if base_dq is not None and upd_dq is not None else base + lora_update
+        else:
+            out = base + lora_update
+        _fp8_ptq.record_module_out_amax(self, tag=f"ffn/{tag}/out_amax", x=out, layer_id=layer_id)
         return out

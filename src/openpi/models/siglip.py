@@ -21,6 +21,9 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from openpi.quantization.fp8_ptq import Fp8Conv
+from openpi.quantization.fp8_ptq import Fp8Dense
+from openpi.quantization.fp8_ptq import MultiHeadDotProductAttentionFp8
 import openpi.training.sharding as sharding
 
 
@@ -46,7 +49,7 @@ def get_posemb(self, typ, seqshape, width, name, dtype=jnp.float32):
             dtype,
         )
     if typ == "sincos2d":
-        return posemb_sincos_2d(*seqshape, width, dtype=dtype)
+        return posemb_sincos_2d(h=seqshape[0], w=seqshape[1], width=width, dtype=dtype)
     raise ValueError(f"Unknown posemb type: {typ}")
 
 
@@ -66,10 +69,22 @@ class MlpBlock(nn.Module):
         }
 
         _, _, d = x.shape  # n,l,d
-        x = nn.Dense(self.mlp_dim or 4 * d, dtype=self.dtype_mm, **inits)(x)
+        x = Fp8Dense(
+            self.mlp_dim or 4 * d,
+            dtype=self.dtype_mm,
+            kernel_init=inits["kernel_init"],
+            bias_init=inits["bias_init"],
+            name="Dense_0",
+        )(x)
         x = nn.gelu(x)
         x = nn.Dropout(rate=self.dropout)(x, deterministic)
-        return nn.Dense(d, dtype=self.dtype_mm, **inits)(x)
+        return Fp8Dense(
+            d,
+            dtype=self.dtype_mm,
+            kernel_init=inits["kernel_init"],
+            bias_init=inits["bias_init"],
+            name="Dense_1",
+        )(x)
 
 
 class Encoder1DBlock(nn.Module):
@@ -85,12 +100,11 @@ class Encoder1DBlock(nn.Module):
         out = {}
         x = sharding.activation_sharding_constraint(x)
         y = nn.LayerNorm(dtype=self.dtype_mm)(x)
-        y = out["sa"] = nn.MultiHeadDotProductAttention(
+        y = out["sa"] = MultiHeadDotProductAttentionFp8(
             num_heads=self.num_heads,
-            kernel_init=nn.initializers.xavier_uniform(),
-            deterministic=deterministic,
             dtype=self.dtype_mm,
-        )(y, y)
+            name="MultiHeadDotProductAttention_0",
+        )(y, y, deterministic=deterministic)
         y = sharding.activation_sharding_constraint(y)
         y = nn.Dropout(rate=self.dropout)(y, deterministic)
         x = out["+sa"] = x + y
@@ -100,6 +114,7 @@ class Encoder1DBlock(nn.Module):
             mlp_dim=self.mlp_dim,
             dropout=self.dropout,
             dtype_mm=self.dtype_mm,
+            name="MlpBlock_0",
         )(y, deterministic)
         y = sharding.activation_sharding_constraint(y)
         y = nn.Dropout(rate=self.dropout)(y, deterministic)
@@ -174,14 +189,14 @@ class MAPHead(nn.Module):
         probe = self.param("probe", nn.initializers.xavier_uniform(), (1, 1, d), x.dtype)
         probe = jnp.tile(probe, [n, 1, 1])
 
-        x = nn.MultiHeadDotProductAttention(
+        x = MultiHeadDotProductAttentionFp8(
             num_heads=self.num_heads,
             dtype=self.dtype_mm,
-            kernel_init=nn.initializers.xavier_uniform(),
+            name="MultiHeadDotProductAttention_0",
         )(probe, x)
 
         y = nn.LayerNorm(dtype=self.dtype_mm)(x)
-        x = x + MlpBlock(mlp_dim=self.mlp_dim, dtype=self.dtype_mm)(y)
+        x = x + MlpBlock(mlp_dim=self.mlp_dim, dtype_mm=self.dtype_mm)(y)
         return x[:, 0]
 
 
@@ -213,13 +228,14 @@ class _Module(nn.Module):
         image = jnp.asarray(image, jnp.float32)
 
         # Patch extraction
-        x = out["stem"] = nn.Conv(
+        x = out["stem"] = Fp8Conv(
             self.width,
             self.patch_size,
             strides=self.patch_size,
             padding="VALID",
             name="embedding",
             dtype=jnp.float32,
+            tag="conv",
         )(image)
 
         n, h, w, c = x.shape
@@ -272,7 +288,7 @@ class _Module(nn.Module):
 
         if self.rep_size:
             rep_size = self.width if self.rep_size is True else self.rep_size
-            hid = nn.Dense(rep_size, dtype=self.dtype_mm, name="pre_logits")
+            hid = Fp8Dense(rep_size, dtype=self.dtype_mm, name="pre_logits")
             # NOTE: In the past we did not include tanh in pre_logits.
             # For few-shot, it should not matter much, as it whitens anyways.
             x_2d = nn.tanh(hid(x_2d))
@@ -283,7 +299,7 @@ class _Module(nn.Module):
 
         if self.num_classes:
             kw = {"kernel_init": nn.initializers.zeros} if self.head_zeroinit else {}
-            head = nn.Dense(self.num_classes, dtype=self.dtype_mm, name="head", **kw)
+            head = Fp8Dense(self.num_classes, dtype=self.dtype_mm, name="head", **kw)
             x_2d = out["logits_2d"] = head(x_2d)
             x = out["logits"] = head(x)
 

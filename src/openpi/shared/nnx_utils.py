@@ -94,7 +94,14 @@ def module_export_stablehlo(
             return stablehlo_module.operation.get_asm(large_elements_limit=elide_elementsattrs_if_larger)  # type: ignore
 
     # Export the function to StableHLO
-    exported_module = export.export(jitted_fn)(*[specs_like(x) for x in example_inputs]).mlir_module()  # type: ignore
+    exported_module = export.export(
+        jitted_fn,
+        disabled_checks=[
+            export.DisabledSafetyCheck.custom_call("tensorrt.dequantize"),
+            export.DisabledSafetyCheck.custom_call("tensorrt.quantize"),
+            export.DisabledSafetyCheck.platform(),
+        ],
+    )(*[specs_like(x) for x in example_inputs]).mlir_module()  # type: ignore
     return get_stablehlo_asm(exported_module)
 
 
